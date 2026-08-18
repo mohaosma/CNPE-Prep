@@ -32,6 +32,12 @@ GATEKEEPER_CHART_VERSION="${GATEKEEPER_CHART_VERSION:-3.17.1}"
 KYVERNO_CHART_VERSION="${KYVERNO_CHART_VERSION:-3.2.7}"
 ISTIO_CHART_VERSION="${ISTIO_CHART_VERSION:-1.24.1}"
 
+# Cilium native-routing lab values based on chapter05/cilium-native-auto-node-routes.yaml.
+# Override these without editing the script when experimenting with different pools.
+CILIUM_MULTI_POOL_CIDR="${CILIUM_MULTI_POOL_CIDR:-10.10.0.0/16}"
+CILIUM_MULTI_POOL_MASK_SIZE="${CILIUM_MULTI_POOL_MASK_SIZE:-27}"
+CILIUM_NATIVE_ROUTING_CIDR="${CILIUM_NATIVE_ROUTING_CIDR:-10.0.0.0/8}"
+
 # Tekton does not publish an official Helm chart for core Pipelines. Use the
 # official release manifest and keep it pinned like the Helm charts above.
 TEKTON_PIPELINES_VERSION="${TEKTON_PIPELINES_VERSION:-v0.65.1}"
@@ -220,20 +226,80 @@ timeout_to_seconds() {
   esac
 }
 
-install_cilium() {
-  local control_plane_ip
+kind_control_plane_ip_from_kubernetes() {
+  kubectl get nodes \
+    -l node-role.kubernetes.io/control-plane \
+    -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true
+}
 
-  control_plane_ip="$(docker inspect -f '{{ .NetworkSettings.Networks.kind.IPAddress }}' "${CLUSTER_NAME}-control-plane")"
+kind_control_plane_ip_from_docker() {
+  local container="${CLUSTER_NAME}-control-plane"
+  local ip
+
+  ip="$(docker inspect -f '{{range $name, $network := .NetworkSettings.Networks}}{{if eq $name "kind"}}{{$network.IPAddress}}{{end}}{{end}}' "$container" 2>/dev/null || true)"
+  if [[ -z "$ip" ]]; then
+    ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' "$container" 2>/dev/null | awk 'NF { print; exit }' || true)"
+  fi
+
+  printf '%s\n' "$ip"
+}
+
+resolve_cilium_k8s_service_host() {
+  local control_plane_ip docker_ip
+
+  control_plane_ip="$(kind_control_plane_ip_from_kubernetes)"
+  docker_ip="$(kind_control_plane_ip_from_docker)"
+
+  if [[ -z "$control_plane_ip" ]]; then
+    control_plane_ip="$docker_ip"
+  fi
+
   [[ -n "$control_plane_ip" ]] || fail "Could not determine kind control-plane IP for Cilium."
+
+  if [[ -n "$docker_ip" && "$control_plane_ip" != "$docker_ip" ]]; then
+    printf 'WARN: Kubernetes control-plane InternalIP is %s, Docker reports %s; using Kubernetes InternalIP.\n' "$control_plane_ip" "$docker_ip" >&2
+  fi
+
+  printf '%s\n' "$control_plane_ip"
+}
+
+install_cilium() {
+  local control_plane_ip cilium_values
+
+  control_plane_ip="$(resolve_cilium_k8s_service_host)"
+  cilium_values="$(mktemp)"
+
+  cat >"$cilium_values" <<EOF
+ipam:
+  mode: multi-pool
+  operator:
+    autoCreateCiliumPodIPPools:
+      default:
+        ipv4:
+          cidrs:
+            - "$CILIUM_MULTI_POOL_CIDR"
+          maskSize: $CILIUM_MULTI_POOL_MASK_SIZE
+routingMode: native
+endpointRoutes:
+  enabled: true
+autoDirectNodeRoutes: true
+ipv4NativeRoutingCIDR: "$CILIUM_NATIVE_ROUTING_CIDR"
+kubeProxyReplacement: true
+k8sServiceHost: "$control_plane_ip"
+k8sServicePort: 6443
+EOF
+
+  log "Installing Cilium native routing with Kubernetes API server $control_plane_ip:6443"
+  log "Cilium pod pool: $CILIUM_MULTI_POOL_CIDR, node mask: $CILIUM_MULTI_POOL_MASK_SIZE, native routing CIDR: $CILIUM_NATIVE_ROUTING_CIDR"
 
   "$HELM" upgrade --install cilium cilium/cilium \
     --version "$CILIUM_CHART_VERSION" \
     --namespace kube-system \
-    --set kubeProxyReplacement=true \
-    --set k8sServiceHost="$control_plane_ip" \
-    --set k8sServicePort=6443 \
+    --values "$cilium_values" \
     --wait \
     --timeout 15m
+
+  rm -f "$cilium_values"
 
   wait_namespace_pods_ready kube-system 15m
   kubectl -n kube-system get pods -l k8s-app=cilium

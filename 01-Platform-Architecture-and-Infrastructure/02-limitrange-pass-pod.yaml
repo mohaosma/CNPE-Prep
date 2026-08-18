@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-pass
+  namespace: limit-range-example
+spec:
+  containers:
+    - name: nginx
+      image: nginx:latest
+      resources:
+        requests:
+          cpu: 200m
+          memory: 200Mi
+        limits:
+          cpu: 500m
+          memory: 500Mi

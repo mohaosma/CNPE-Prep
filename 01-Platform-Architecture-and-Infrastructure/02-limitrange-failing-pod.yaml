@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-fail
+  namespace: limit-range-example
+spec:
+  containers:
+    - name: nginx
+      image: nginx:latest
+      resources:
+        requests:
+          cpu: 200m
+          memory: 200Mi
+        limits:
+          cpu: "2"
+          memory: 500Mi

@@ -1,0 +1,53 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name:  db-class
+  annotations:
+    storage.k8s.io/is-default-class: "false"
+provisioner: rancher.io/local-path
+reclaimPolicy: Retain
+allowVolumeExpansion: false
+volumeBindingMode: WaitForFirstConsumer
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: storage-example
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: db-pvc
+  namespace: storage-example
+spec:
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: db-class
+  accessModes:
+    - ReadWriteOnce
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+  namespace: storage-example
+
+spec:
+  containers:
+  - name: myapp
+    image: nginx:latest
+    resources:
+      limits:
+        memory: "128Mi"
+        cpu: "500m"
+    ports:
+      - containerPort: 80
+    volumeMounts:
+    - mountPath: /data
+      name: db-storage
+  volumes:
+  - name: db-storage
+    persistentVolumeClaim:
+      claimName: db-pvc
+

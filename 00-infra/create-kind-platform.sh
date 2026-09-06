@@ -31,6 +31,7 @@ CROSSPLANE_CHART_VERSION="${CROSSPLANE_CHART_VERSION:-1.17.2}"
 GATEKEEPER_CHART_VERSION="${GATEKEEPER_CHART_VERSION:-3.17.1}"
 KYVERNO_CHART_VERSION="${KYVERNO_CHART_VERSION:-3.2.7}"
 ISTIO_CHART_VERSION="${ISTIO_CHART_VERSION:-1.24.1}"
+INGRESS_NGINX_CHART_VERSION="${INGRESS_NGINX_CHART_VERSION:-4.11.3}"
 
 # Cilium native-routing lab values based on chapter05/cilium-native-auto-node-routes.yaml.
 # Override these without editing the script when experimenting with different pools.
@@ -157,6 +158,12 @@ nodes:
       - containerPort: 30443
         hostPort: 8443
         protocol: TCP
+      - containerPort: 30081
+        hostPort: 8081
+        protocol: TCP
+      - containerPort: 30444
+        hostPort: 8444
+        protocol: TCP
   - role: worker
   - role: worker
 EOF
@@ -175,6 +182,7 @@ add_helm_repos() {
   "$HELM" repo add gatekeeper https://open-policy-agent.github.io/gatekeeper/charts
   "$HELM" repo add kyverno https://kyverno.github.io/kyverno/
   "$HELM" repo add istio https://istio-release.storage.googleapis.com/charts
+  "$HELM" repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
   "$HELM" repo update
 }
 
@@ -422,6 +430,23 @@ install_kyverno() {
   verify_api clusterpolicies.kyverno.io
 }
 
+install_ingress_nginx() {
+  kubectl create namespace ingress-nginx --dry-run=client -o yaml | kubectl apply -f -
+
+  "$HELM" upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+    --version "$INGRESS_NGINX_CHART_VERSION" \
+    --namespace ingress-nginx \
+    --set controller.service.type=NodePort \
+    --set controller.service.nodePorts.http=30080 \
+    --set controller.service.nodePorts.https=30443 \
+    --wait \
+    --timeout 10m
+
+  wait_namespace_pods_ready ingress-nginx 10m
+  verify_api ingresses.networking.k8s.io
+  verify_api ingressclasses.networking.k8s.io
+}
+
 install_istio() {
   kubectl create namespace istio-system --dry-run=client -o yaml | kubectl apply -f -
   kubectl create namespace istio-ingress --dry-run=client -o yaml | kubectl apply -f -
@@ -448,11 +473,11 @@ install_istio() {
     --set service.ports[1].name=http2 \
     --set service.ports[1].port=80 \
     --set service.ports[1].targetPort=80 \
-    --set service.ports[1].nodePort=30080 \
+    --set service.ports[1].nodePort=30081 \
     --set service.ports[2].name=https \
     --set service.ports[2].port=443 \
     --set service.ports[2].targetPort=443 \
-    --set service.ports[2].nodePort=30443 \
+    --set service.ports[2].nodePort=30444 \
     --wait \
     --timeout 10m
 
@@ -682,6 +707,7 @@ up_platform() {
   install_gatekeeper
   install_kyverno
   install_istio
+  install_ingress_nginx
 
   print_summary
 }

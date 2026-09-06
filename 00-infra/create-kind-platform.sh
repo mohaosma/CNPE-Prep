@@ -31,6 +31,13 @@ CROSSPLANE_CHART_VERSION="${CROSSPLANE_CHART_VERSION:-1.17.2}"
 GATEKEEPER_CHART_VERSION="${GATEKEEPER_CHART_VERSION:-3.17.1}"
 KYVERNO_CHART_VERSION="${KYVERNO_CHART_VERSION:-3.2.7}"
 ISTIO_CHART_VERSION="${ISTIO_CHART_VERSION:-1.24.1}"
+INGRESS_NGINX_CHART_VERSION="${INGRESS_NGINX_CHART_VERSION:-4.11.3}"
+
+# Cilium native-routing lab values based on chapter05/cilium-native-auto-node-routes.yaml.
+# Override these without editing the script when experimenting with different pools.
+CILIUM_MULTI_POOL_CIDR="${CILIUM_MULTI_POOL_CIDR:-10.10.0.0/16}"
+CILIUM_MULTI_POOL_MASK_SIZE="${CILIUM_MULTI_POOL_MASK_SIZE:-27}"
+CILIUM_NATIVE_ROUTING_CIDR="${CILIUM_NATIVE_ROUTING_CIDR:-10.0.0.0/8}"
 
 # Tekton does not publish an official Helm chart for core Pipelines. Use the
 # official release manifest and keep it pinned like the Helm charts above.
@@ -151,6 +158,12 @@ nodes:
       - containerPort: 30443
         hostPort: 8443
         protocol: TCP
+      - containerPort: 30081
+        hostPort: 8081
+        protocol: TCP
+      - containerPort: 30444
+        hostPort: 8444
+        protocol: TCP
   - role: worker
   - role: worker
 EOF
@@ -169,6 +182,7 @@ add_helm_repos() {
   "$HELM" repo add gatekeeper https://open-policy-agent.github.io/gatekeeper/charts
   "$HELM" repo add kyverno https://kyverno.github.io/kyverno/
   "$HELM" repo add istio https://istio-release.storage.googleapis.com/charts
+  "$HELM" repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
   "$HELM" repo update
 }
 
@@ -220,20 +234,80 @@ timeout_to_seconds() {
   esac
 }
 
-install_cilium() {
-  local control_plane_ip
+kind_control_plane_ip_from_kubernetes() {
+  kubectl get nodes \
+    -l node-role.kubernetes.io/control-plane \
+    -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true
+}
 
-  control_plane_ip="$(docker inspect -f '{{ .NetworkSettings.Networks.kind.IPAddress }}' "${CLUSTER_NAME}-control-plane")"
+kind_control_plane_ip_from_docker() {
+  local container="${CLUSTER_NAME}-control-plane"
+  local ip
+
+  ip="$(docker inspect -f '{{range $name, $network := .NetworkSettings.Networks}}{{if eq $name "kind"}}{{$network.IPAddress}}{{end}}{{end}}' "$container" 2>/dev/null || true)"
+  if [[ -z "$ip" ]]; then
+    ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' "$container" 2>/dev/null | awk 'NF { print; exit }' || true)"
+  fi
+
+  printf '%s\n' "$ip"
+}
+
+resolve_cilium_k8s_service_host() {
+  local control_plane_ip docker_ip
+
+  control_plane_ip="$(kind_control_plane_ip_from_kubernetes)"
+  docker_ip="$(kind_control_plane_ip_from_docker)"
+
+  if [[ -z "$control_plane_ip" ]]; then
+    control_plane_ip="$docker_ip"
+  fi
+
   [[ -n "$control_plane_ip" ]] || fail "Could not determine kind control-plane IP for Cilium."
+
+  if [[ -n "$docker_ip" && "$control_plane_ip" != "$docker_ip" ]]; then
+    printf 'WARN: Kubernetes control-plane InternalIP is %s, Docker reports %s; using Kubernetes InternalIP.\n' "$control_plane_ip" "$docker_ip" >&2
+  fi
+
+  printf '%s\n' "$control_plane_ip"
+}
+
+install_cilium() {
+  local control_plane_ip cilium_values
+
+  control_plane_ip="$(resolve_cilium_k8s_service_host)"
+  cilium_values="$(mktemp)"
+
+  cat >"$cilium_values" <<EOF
+ipam:
+  mode: multi-pool
+  operator:
+    autoCreateCiliumPodIPPools:
+      default:
+        ipv4:
+          cidrs:
+            - "$CILIUM_MULTI_POOL_CIDR"
+          maskSize: $CILIUM_MULTI_POOL_MASK_SIZE
+routingMode: native
+endpointRoutes:
+  enabled: true
+autoDirectNodeRoutes: true
+ipv4NativeRoutingCIDR: "$CILIUM_NATIVE_ROUTING_CIDR"
+kubeProxyReplacement: true
+k8sServiceHost: "$control_plane_ip"
+k8sServicePort: 6443
+EOF
+
+  log "Installing Cilium native routing with Kubernetes API server $control_plane_ip:6443"
+  log "Cilium pod pool: $CILIUM_MULTI_POOL_CIDR, node mask: $CILIUM_MULTI_POOL_MASK_SIZE, native routing CIDR: $CILIUM_NATIVE_ROUTING_CIDR"
 
   "$HELM" upgrade --install cilium cilium/cilium \
     --version "$CILIUM_CHART_VERSION" \
     --namespace kube-system \
-    --set kubeProxyReplacement=true \
-    --set k8sServiceHost="$control_plane_ip" \
-    --set k8sServicePort=6443 \
+    --values "$cilium_values" \
     --wait \
     --timeout 15m
+
+  rm -f "$cilium_values"
 
   wait_namespace_pods_ready kube-system 15m
   kubectl -n kube-system get pods -l k8s-app=cilium
@@ -356,6 +430,23 @@ install_kyverno() {
   verify_api clusterpolicies.kyverno.io
 }
 
+install_ingress_nginx() {
+  kubectl create namespace ingress-nginx --dry-run=client -o yaml | kubectl apply -f -
+
+  "$HELM" upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+    --version "$INGRESS_NGINX_CHART_VERSION" \
+    --namespace ingress-nginx \
+    --set controller.service.type=NodePort \
+    --set controller.service.nodePorts.http=30080 \
+    --set controller.service.nodePorts.https=30443 \
+    --wait \
+    --timeout 10m
+
+  wait_namespace_pods_ready ingress-nginx 10m
+  verify_api ingresses.networking.k8s.io
+  verify_api ingressclasses.networking.k8s.io
+}
+
 install_istio() {
   kubectl create namespace istio-system --dry-run=client -o yaml | kubectl apply -f -
   kubectl create namespace istio-ingress --dry-run=client -o yaml | kubectl apply -f -
@@ -382,11 +473,11 @@ install_istio() {
     --set service.ports[1].name=http2 \
     --set service.ports[1].port=80 \
     --set service.ports[1].targetPort=80 \
-    --set service.ports[1].nodePort=30080 \
+    --set service.ports[1].nodePort=30081 \
     --set service.ports[2].name=https \
     --set service.ports[2].port=443 \
     --set service.ports[2].targetPort=443 \
-    --set service.ports[2].nodePort=30443 \
+    --set service.ports[2].nodePort=30444 \
     --wait \
     --timeout 10m
 
@@ -616,6 +707,7 @@ up_platform() {
   install_gatekeeper
   install_kyverno
   install_istio
+  install_ingress_nginx
 
   print_summary
 }
